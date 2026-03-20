@@ -1,0 +1,31 @@
+# Trading Configuration
+
+# Bankroll Settings
+bankroll: 100.0
+kelly_fraction: 0.5
+max_position_pct: 0.25
+
+# Risk Management
+daily_loss_limit: 0.10  # 10% of bankroll
+max_consecutive_losses: 3
+max_trades_per_window: 2
+
+# Entry Settings
+limit_price: 0.46
+trade_size: 5.0
+min_edge: 0.05  # 5% minimum edge
+btc_threshold: 0.005  # 0.5% BTC move to trigger
+
+# Exit Settings
+winner_target: 0.90
+loser_exit: 0.10
+one_sided_stop_base: 0.35
+max_hold_time: 60  # seconds
+
+# API Configuration
+binance_ws_url: "wss://fstream.binance.com/ws/btcusdt@markPrice@1s"
+polymarket_ws_url: "wss://clob.polymarket.com/ws/market"
+
+# Logging
+log_level: INFO
+discord_alerts: true
