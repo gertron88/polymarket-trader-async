@@ -30,11 +30,12 @@ class Position:
     exit_time: Optional[float] = None
     pnl: Optional[float] = None
     status: str = "open"  # 'open', 'closed', 'cancelling'
-    
+    metadata: Optional[Dict[str, Any]] = None
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert position to dictionary for serialization."""
         return asdict(self)
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Position":
         """Create position from dictionary."""
@@ -168,7 +169,8 @@ class StateManager:
                             entry_price=data['price'],
                             entry_time=data['timestamp'],
                             order_id=data.get('order_id'),
-                            status='open'
+                            status='open',
+                            metadata=data.get('metadata')
                         )
                         self._positions[position.window_ts] = position
                     

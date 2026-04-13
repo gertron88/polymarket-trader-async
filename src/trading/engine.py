@@ -16,12 +16,13 @@ from feeds.price_feed import create_price_feed
 from feeds.polymarket_ws import PolymarketWebSocket
 from market.gamma_api import GammaAPIClient, MarketWindow
 from execution.orders import OrderExecutor
-from execution.state import StateManager
+from execution.state import StateManager, create_entry_event, create_exit_event
 from execution.clob_client import get_clob_client
 from trading.position import PositionManager, Position
 from trading.sizing import KellySizer
 from trading.short_window_exits import ShortWindowExitManager, ExitTrigger
 from risk import CircuitBreakerPanel
+from analysis import MarketStateLogger
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,10 @@ class TradingEngine:
         self.current_btc_price = 0.0
         self.current_btc_change = 0.0
         self.poly_prices: Dict[str, dict] = {}
+        self._current_window: Optional[dict] = None
+        
+        # Market state logger
+        self.market_state_logger: Optional[MarketStateLogger] = None
         
         # Running flag
         self.running = False
@@ -102,6 +107,13 @@ class TradingEngine:
             max_position_dollars=self.config.get('max_position_dollars', 5.0)
         )
         
+        # Initialize market state logger
+        self.market_state_logger = MarketStateLogger(
+            filepath=self.config.get('market_state_log_path', 'data/market_state.jsonl'),
+            flush_interval=5.0
+        )
+        await self.market_state_logger.initialize()
+        
         # Initialize state manager
         self.state_manager = StateManager(
             filepath='data/state.jsonl',
@@ -110,8 +122,8 @@ class TradingEngine:
         await self.state_manager.initialize()
         
         # Load existing positions
-        for pos_data in self.state_manager.get_all_positions():
-            pos = Position.from_dict(pos_data)
+        for pos in self.state_manager.get_all_positions().values():
+            pos = Position.from_dict(pos.to_dict())
             self.position_manager.add_position(pos)
         
         # Initialize Gamma API client for market discovery
@@ -167,6 +179,7 @@ class TradingEngine:
         asyncio.create_task(self._periodic_exit_check())
         asyncio.create_task(self._periodic_stats_log())
         asyncio.create_task(self._periodic_rpc_check())
+        asyncio.create_task(self._periodic_market_state_log())
         
         logger.info("Trading engine initialized")
         logger.info("=" * 60)
@@ -212,6 +225,10 @@ class TradingEngine:
         signal = Signal(side=side, btc_change=btc_change, confidence=confidence)
         
         logger.info(f"Signal: {side} | BTC change: {btc_change:.4f} | Confidence: {confidence:.2f}")
+        
+        # Log signal snapshot
+        if self.market_state_logger:
+            await self.market_state_logger.log_signal(self, signal)
         
         # Execute entry
         await self._execute_entry(signal)
@@ -318,6 +335,23 @@ class TradingEngine:
             self.total_trades += 1
             return
         
+        # Capture full market context at moment of entry
+        limit_price = self.config.get('limit_price', 0.46)
+        entry_metadata = {
+            'btc_price': self.current_btc_price,
+            'btc_change_30s': self.current_btc_change,
+            'up_ask': up_ask,
+            'down_ask': down_ask,
+            'combined_price': combined,
+            'edge': edge,
+            'limit_price': limit_price,
+            'position_size': size,
+            'confidence': signal.confidence,
+            'signal_side': signal.side,
+            'window_ts': window_ts,
+            'market_id': window.get('market_id'),
+        }
+
         # Create position
         position = self.position_manager.create_position(
             window_ts=window_ts,
@@ -325,33 +359,33 @@ class TradingEngine:
             down_token=down_token,
             size=size
         )
-        
+        position.metadata = entry_metadata
+
         # Subscribe to order book updates for this window
         await self.polymarket_ws.subscribe(up_token)
         await self.polymarket_ws.subscribe(down_token)
-        
+
         # Place orders
-        limit_price = self.config.get('limit_price', 0.46)
         logger.info(f"Placing entry orders at ${limit_price:.2f}...")
-        
+
         up_id, down_id = await self.order_executor.place_entry_orders(
             up_token=up_token,
             down_token=down_token,
             size=size,
             price=limit_price
         )
-        
+
         if up_id:
             position.up_id = up_id
             logger.info(f"UP order placed: {up_id}")
         if down_id:
             position.down_id = down_id
             logger.info(f"DOWN order placed: {down_id}")
-        
+
         # Record expected price for slippage monitoring
         if self.breaker_panel:
             self.breaker_panel.slippage_monitor.record_entry(limit_price, limit_price, size)
-            
+
         # Create short-window exit manager for this position
         exit_mgr = ShortWindowExitManager(
             entry_price=limit_price,
@@ -362,16 +396,27 @@ class TradingEngine:
             stop_loss_pct=self.config.get('stop_loss_pct', 0.10)
         )
         self._exit_managers[window_ts] = exit_mgr
-            
+
         # Update tracking
         self.has_traded = True
         self.total_trades += 1
         self.window_trades[window_ts] = self.window_trades.get(window_ts, 0) + 1
         self.last_trade_time = time.time()
-        
+
         logger.info(f"✅ Entry complete - Trade {self.total_trades}/1 executed")
         logger.info("=" * 60)
-        
+
+        # Log entry trade event with rich metadata
+        entry_event = create_entry_event(
+            window_ts=window_ts,
+            side=signal.side,
+            size=size,
+            price=limit_price,
+            order_id=up_id or down_id,
+            metadata=entry_metadata
+        )
+        await self.state_manager.log_trade_event(entry_event)
+
         # Save state
         await self.state_manager.update_position(position)
         
@@ -443,48 +488,87 @@ class TradingEngine:
             
     async def _execute_exit(self, position: Position, side: str, price: float, reason: str):
         """Execute exit order"""
-        
+
         logger.info(f"EXIT: Window {position.window_ts} {side} @ ${price:.2f} | {reason}")
-        
+
         token_id = position.up_token if side == 'UP' else position.down_token
-        
+
+        # Capture exit market context
+        exit_btc_price = self.current_btc_price
+        exit_btc_change = self.current_btc_change
+        exit_up_bid = self.poly_prices.get(position.up_token, {}).get('bid', 0)
+        exit_down_bid = self.poly_prices.get(position.down_token, {}).get('bid', 0)
+        time_held_seconds = time.time() - position.entry_time
+
+        exit_metadata = {
+            'exit_btc_price': exit_btc_price,
+            'exit_btc_change': exit_btc_change,
+            'exit_up_bid': exit_up_bid,
+            'exit_down_bid': exit_down_bid,
+            'exit_reason': reason,
+            'time_held_seconds': round(time_held_seconds, 3),
+        }
+
         # Place exit order
         order_id = await self.order_executor.place_exit_order(
             token_id=token_id,
             size=position.size,
             price=price
         )
-        
+
         if order_id:
             # Update position
             self.position_manager.update_exit(position.window_ts, side, price)
-            
+
             # Calculate P&L
             pnl = self.position_manager.calculate_realized_pnl(position)
             self.daily_pnl += pnl
             self.sizer.update_trade(pnl)
-            
+
             # Feed circuit breakers
             if self.breaker_panel:
                 self.breaker_panel.record_trade(pnl)
-            
+
             # Record slippage on exit
             if self.breaker_panel:
-                self.breaker_panel.slippage_monitor.record_exit(exit_price, exit_price, position.size)
-            
+                self.breaker_panel.slippage_monitor.record_exit(price, price, position.size)
+
             logger.info(f"Exit complete: P&L ${pnl:+.2f} | Daily: ${self.daily_pnl:+.2f}")
-            
+
+            # Log exit trade event with rich metadata
+            exit_event = create_exit_event(
+                window_ts=position.window_ts,
+                side=side,
+                size=position.size,
+                price=price,
+                order_id=order_id,
+                pnl=pnl,
+                metadata=exit_metadata
+            )
+            await self.state_manager.log_trade_event(exit_event)
+
             # Save state
             await self.state_manager.update_position(position)
-            
+
             # Set cooldown after loss
             if pnl < 0:
                 self.cooldown_until = time.time() + 10  # 10s cooldown
-            
+
             # Clean up exit manager
             if position.window_ts in self._exit_managers:
                 del self._exit_managers[position.window_ts]
                 
+    async def _periodic_market_state_log(self):
+        """Log periodic market state snapshots"""
+        interval = self.config.get('market_state_log_interval', 1.0)
+        while self.running:
+            try:
+                if self.market_state_logger:
+                    await self.market_state_logger.log_snapshot(self)
+            except Exception as e:
+                logger.error(f"Error in market state log: {e}")
+            await asyncio.sleep(interval)
+
     async def _periodic_stats_log(self):
         """Log periodic statistics"""
         while self.running:
@@ -541,13 +625,18 @@ class TradingEngine:
                 f"Combined: ${window.combined_price:.4f}"
             )
             
-            return {
+            self._current_window = {
                 'timestamp': window.timestamp,
                 'up_token': window.up_token,
                 'down_token': window.down_token,
                 'market_id': window.market_id,
-                'end_time': window.end_time.isoformat() if hasattr(window.end_time, 'isoformat') else str(window.end_time)
+                'end_time': window.end_time.isoformat() if hasattr(window.end_time, 'isoformat') else str(window.end_time),
+                'up_ask': window.up_ask if hasattr(window, 'up_ask') else 0.0,
+                'down_ask': window.down_ask if hasattr(window, 'down_ask') else 0.0,
+                'combined': window.combined_price if hasattr(window, 'combined_price') else 1.0,
+                'edge': window.edge if hasattr(window, 'edge') else 0.0,
             }
+            return self._current_window
         except Exception as e:
             logger.error(f"Failed to get current window: {e}")
             return None
@@ -596,5 +685,9 @@ class TradingEngine:
         # Final state flush
         if self.state_manager:
             await self.state_manager.close()
+        
+        # Close market state logger
+        if self.market_state_logger:
+            await self.market_state_logger.close()
             
         logger.info("Trading engine shut down")

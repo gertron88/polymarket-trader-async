@@ -59,3 +59,5 @@ trading_mode: dry_run  # ⚠️ KEEP AS dry_run OR paper FOR TESTING
 # Logging
 log_level: INFO
 discord_alerts: true
+market_state_log_path: data/market_state.jsonl
+market_state_log_interval: 1.0

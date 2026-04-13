@@ -6,7 +6,7 @@ P&L is always computed using ACTUAL fill prices, not theoretical assumptions.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Any
 from enum import Enum
 import time
 
@@ -62,6 +62,7 @@ class Position:
     summary_sent: bool = False
     up_entry_price: float = 0.0
     down_entry_price: float = 0.0
+    metadata: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         """Set entry time if not provided."""
@@ -116,8 +117,17 @@ class Position:
             "summary_sent": self.summary_sent,
             "up_entry_price": self.up_entry_price,
             "down_entry_price": self.down_entry_price,
-            "state": self.state.value
+            "state": self.state.value,
+            "metadata": self.metadata
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Position":
+        """Create position from dictionary."""
+        # Filter to only known fields
+        known_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in data.items() if k in known_fields}
+        return cls(**filtered)
 
 
 class PositionManager:
