@@ -1,13 +1,26 @@
-# Polymarket Async Trading Bot
+# ⚠️ DEPRECATED — Polymarket Async Trading Bot
+
+**This project is ARCHIVED and should NOT be deployed with real capital.**
+
+See [`DEPRECATION_NOTICE.md`](DEPRECATION_NOTICE.md) for full details on why the core strategy is mathematically invalid.
+
+---
+
+## Successor Project
+
+**[`polymarket-kalshi-arb/`](../polymarket-kalshi-arb/)** — Cross-platform prediction market arbitrage (Polymarket ↔ Kalshi)
+
+---
+
+## Original Description (For Reference Only)
 
 High-frequency trading bot for Polymarket with sub-100ms latency.
 
-## Architecture
-
+### Architecture
 - **Language:** Python 3.11+ with asyncio
 - **Latency Target:** 80-120ms (down from 700ms)
 - **Data Feeds:** WebSocket (Binance + Polymarket)
-- **Strategy:** BTC price arbitrage on 5-minute markets
+- **Strategy:** BTC price arbitrage on 5-minute markets (directional speculation, not true arbitrage)
 
 ## Components
 
