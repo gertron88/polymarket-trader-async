@@ -19,6 +19,8 @@ from pathlib import Path
 import yaml
 import structlog
 
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
 from trading.engine import TradingEngine
 
 # Configure structured logging

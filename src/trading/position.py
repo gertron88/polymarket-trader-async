@@ -2,6 +2,7 @@
 Position management module for tracking and managing trading positions.
 
 Handles fill tracking, exit logic with dynamic stop losses, and P&L calculation.
+P&L is always computed using ACTUAL fill prices, not theoretical assumptions.
 """
 
 from dataclasses import dataclass, field
@@ -24,7 +25,8 @@ class Position:
     """
     Represents a market-neutral position with both UP and DOWN tokens.
     
-    Tracks fills, exits, and P&L for both sides independently.
+    Tracks fills, exits, and P&L for both sides independently using
+    actual fill prices recorded at execution time.
     
     Attributes:
         window_ts: Window timestamp (unique position ID)
@@ -39,9 +41,10 @@ class Position:
         up_exit_price: UP exit price (if exited)
         down_exit_price: DOWN exit price (if exited)
         entry_time: Position entry timestamp
-        entry_price: Entry price for P&L calculation (default 0.46)
-        size: Position size in USD (default 5.0)
+        size: Position size in USD per side
         summary_sent: Whether summary has been sent
+        up_entry_price: Actual fill price for UP side
+        down_entry_price: Actual fill price for DOWN side
     """
     window_ts: int
     up_token: str
@@ -55,34 +58,31 @@ class Position:
     up_exit_price: float = 0.0
     down_exit_price: float = 0.0
     entry_time: float = 0.0
-    entry_price: float = 0.46
     size: float = 5.0
     summary_sent: bool = False
-    
-    # Internal state tracking
     up_entry_price: float = 0.0
     down_entry_price: float = 0.0
-    
+
     def __post_init__(self):
         """Set entry time if not provided."""
         if self.entry_time == 0.0:
             self.entry_time = time.time()
-    
+
     @property
     def is_fully_filled(self) -> bool:
         """Check if both sides are filled."""
         return self.up_filled and self.down_filled
-    
+
     @property
     def is_exited(self) -> bool:
         """Check if position is fully exited."""
         return self.up_exited and self.down_exited
-    
+
     @property
     def is_partially_exited(self) -> bool:
         """Check if position is partially exited."""
         return self.up_exited != self.down_exited
-    
+
     @property
     def state(self) -> PositionState:
         """Determine current position state."""
@@ -96,7 +96,7 @@ class Position:
             return PositionState.PARTIAL_FILL
         else:
             return PositionState.PENDING
-    
+
     def to_dict(self) -> Dict:
         """Convert position to dictionary for serialization."""
         return {
@@ -112,7 +112,6 @@ class Position:
             "up_exit_price": self.up_exit_price,
             "down_exit_price": self.down_exit_price,
             "entry_time": self.entry_time,
-            "entry_price": self.entry_price,
             "size": self.size,
             "summary_sent": self.summary_sent,
             "up_entry_price": self.up_entry_price,
@@ -131,18 +130,17 @@ class PositionManager:
     Attributes:
         positions: Dictionary mapping window_ts to Position objects
     """
-    
+
     def __init__(self):
         """Initialize empty position manager."""
         self.positions: Dict[int, Position] = {}
-    
+
     def create_position(
         self,
         window_ts: int,
         up_token: str,
         down_token: str,
-        size: float = 5.0,
-        entry_price: float = 0.46
+        size: float = 5.0
     ) -> Position:
         """
         Create a new position for a trading window.
@@ -151,8 +149,7 @@ class PositionManager:
             window_ts: Window timestamp (used as position ID)
             up_token: UP token identifier
             down_token: DOWN token identifier
-            size: Position size in USD
-            entry_price: Entry price for P&L calculation
+            size: Position size in USD per side
             
         Returns:
             New Position instance
@@ -162,18 +159,17 @@ class PositionManager:
         """
         if window_ts in self.positions:
             raise ValueError(f"Position already exists for window {window_ts}")
-        
+
         position = Position(
             window_ts=window_ts,
             up_token=up_token,
             down_token=down_token,
             size=size,
-            entry_price=entry_price,
             entry_time=time.time()
         )
         self.positions[window_ts] = position
         return position
-    
+
     def get_position(self, window_ts: int) -> Optional[Position]:
         """
         Get position by window timestamp.
@@ -185,7 +181,7 @@ class PositionManager:
             Position if found, None otherwise
         """
         return self.positions.get(window_ts)
-    
+
     def update_fill(
         self,
         window_ts: int,
@@ -194,13 +190,13 @@ class PositionManager:
         fill_price: float = 0.0
     ) -> bool:
         """
-        Update fill status for a position side.
+        Update fill status for a position side and record actual fill price.
         
         Args:
             window_ts: Window timestamp
             side: "up" or "down"
             filled: New fill status
-            fill_price: Fill price if filled (optional)
+            fill_price: Actual fill price if filled
             
         Returns:
             True if update successful, False if position not found
@@ -211,7 +207,7 @@ class PositionManager:
         position = self.positions.get(window_ts)
         if not position:
             return False
-        
+
         side = side.lower()
         if side == "up":
             position.up_filled = filled
@@ -223,9 +219,9 @@ class PositionManager:
                 position.down_entry_price = fill_price
         else:
             raise ValueError(f"Invalid side: {side}. Must be 'up' or 'down'")
-        
+
         return True
-    
+
     def update_order_id(
         self,
         window_ts: int,
@@ -249,7 +245,7 @@ class PositionManager:
         position = self.positions.get(window_ts)
         if not position:
             return False
-        
+
         side = side.lower()
         if side == "up":
             position.up_id = order_id
@@ -257,9 +253,9 @@ class PositionManager:
             position.down_id = order_id
         else:
             raise ValueError(f"Invalid side: {side}. Must be 'up' or 'down'")
-        
+
         return True
-    
+
     def update_exit(
         self,
         window_ts: int,
@@ -280,7 +276,7 @@ class PositionManager:
         position = self.positions.get(window_ts)
         if not position:
             return False
-        
+
         side = side.lower()
         if side == "up":
             position.up_exited = True
@@ -290,9 +286,9 @@ class PositionManager:
             position.down_exit_price = exit_price
         else:
             raise ValueError(f"Invalid side: {side}. Must be 'up' or 'down'")
-        
+
         return True
-    
+
     def calculate_exit_price(
         self,
         position: Position,
@@ -317,24 +313,22 @@ class PositionManager:
         # Calculate progress ratio (0 = start, 1 = end)
         progress = 1.0 - (time_remaining / window_duration)
         progress = max(0.0, min(1.0, progress))  # Clamp to [0, 1]
-        
+
         # Dynamic stop range:
         # Early (0%): tight stop at 0.35
         # Late (100%): wide stop at 0.25
         early_stop = 0.35
         late_stop = 0.25
-        
+
         # Linear interpolation between early and late stops
         stop_threshold = early_stop + (late_stop - early_stop) * progress
-        
-        # Calculate exit prices from entry price
-        # UP side: exit if price drops to threshold
-        # DOWN side: exit if price rises to threshold
+
+        # Calculate exit prices
         up_exit_price = stop_threshold
         down_exit_price = 1.0 - stop_threshold
-        
+
         return (up_exit_price, down_exit_price)
-    
+
     def should_exit(
         self,
         position: Position,
@@ -358,101 +352,92 @@ class PositionManager:
         """
         if not position.is_fully_filled or position.is_exited:
             return (False, False)
-        
+
         up_exit_price, down_exit_price = self.calculate_exit_price(
             position, time_remaining, window_duration
         )
-        
+
         should_exit_up = up_price <= up_exit_price and not position.up_exited
         should_exit_down = down_price >= down_exit_price and not position.down_exited
-        
+
         return (should_exit_up, should_exit_down)
-    
+
     def calculate_pnl(self, position: Position) -> float:
         """
-        Calculate current P&L for a position.
+        Calculate current P&L for a position using ACTUAL fill prices.
         
-        For active positions, estimates P&L based on entry price vs current
-        theoretical midpoint. For closed positions, uses actual exit prices.
+        For exited sides, uses actual exit price minus actual entry price.
+        For filled but unexited sides, contributes 0.0 (no mark-to-market
+        in this method — use current market data elsewhere for unrealized).
+        For unfilled sides, contributes 0.0.
+        
+        If one side of a market-neutral position fills and the other doesn't,
+        P&L reflects only the actual exposure.
         
         Args:
             position: Position to calculate P&L for
             
         Returns:
-            Estimated or realized P&L in USD
+            Realized P&L in USD from exited sides
         """
-        if not position.is_fully_filled:
-            return 0.0
-        
-        # Determine exit prices
-        if position.is_exited:
-            # Use actual exit prices
-            up_exit = position.up_exit_price if position.up_exited else position.entry_price
-            down_exit = position.down_exit_price if position.down_exited else position.entry_price
-        else:
-            # For active positions, use entry price as theoretical
-            up_exit = position.entry_price
-            down_exit = position.entry_price
-        
-        # Calculate P&L per side
-        # P&L = (exit_price - entry_price) * size
-        # UP: profit if exit > entry
-        # DOWN: profit if exit < entry (but price is inverted, so exit > entry means loss)
-        
-        up_pnl = (up_exit - position.entry_price) * position.size
-        down_pnl = ((1.0 - down_exit) - (1.0 - position.entry_price)) * position.size
-        down_pnl = -down_pnl  # Invert for DOWN token
-        
-        total_pnl = up_pnl + down_pnl
-        
+        total_pnl = 0.0
+
+        # UP side: only count if filled and exited using actual prices
+        if position.up_filled and position.up_exited and position.up_entry_price > 0:
+            up_pnl = (position.up_exit_price - position.up_entry_price) * position.size
+            total_pnl += up_pnl
+
+        # DOWN side: only count if filled and exited using actual prices
+        if position.down_filled and position.down_exited and position.down_entry_price > 0:
+            down_pnl = (position.down_exit_price - position.down_entry_price) * position.size
+            total_pnl += down_pnl
+
         return total_pnl
-    
+
     def calculate_realized_pnl(self, position: Position) -> float:
         """
-        Calculate realized P&L for a closed position.
+        Calculate realized P&L for a position using ACTUAL fill prices.
+        
+        Only counts sides that have both filled and exited.
+        Returns 0.0 if no sides are realized.
         
         Args:
             position: Position to calculate P&L for
             
         Returns:
-            Realized P&L in USD (0.0 if position not closed)
+            Realized P&L in USD
         """
-        if not position.is_exited:
-            return 0.0
-        
-        up_pnl = 0.0
-        down_pnl = 0.0
-        
-        if position.up_exited:
-            up_pnl = (position.up_exit_price - position.entry_price) * position.size
-        
-        if position.down_exited:
-            # DOWN profit when price drops (exit < entry)
-            down_pnl = (position.entry_price - position.down_exit_price) * position.size
-        
-        return up_pnl + down_pnl
-    
+        total_pnl = 0.0
+
+        if position.up_filled and position.up_exited and position.up_entry_price > 0:
+            total_pnl += (position.up_exit_price - position.up_entry_price) * position.size
+
+        if position.down_filled and position.down_exited and position.down_entry_price > 0:
+            total_pnl += (position.down_exit_price - position.down_entry_price) * position.size
+
+        return total_pnl
+
     def get_active_positions(self) -> list[Position]:
         """Get all active (fully filled, not exited) positions."""
         return [
             p for p in self.positions.values()
             if p.is_fully_filled and not p.is_exited
         ]
-    
+
     def get_pending_positions(self) -> list[Position]:
         """Get all pending (not fully filled) positions."""
         return [
             p for p in self.positions.values()
             if not p.is_fully_filled
         ]
-    
+
     def get_closed_positions(self) -> list[Position]:
         """Get all closed positions."""
         return [
             p for p in self.positions.values()
             if p.is_exited
         ]
-    
+
     def mark_summary_sent(self, window_ts: int) -> bool:
         """
         Mark that summary has been sent for a position.
@@ -468,7 +453,7 @@ class PositionManager:
             position.summary_sent = True
             return True
         return False
-    
+
     def remove_position(self, window_ts: int) -> bool:
         """
         Remove a position from tracking.
@@ -483,7 +468,7 @@ class PositionManager:
             del self.positions[window_ts]
             return True
         return False
-    
+
     def clear_closed_positions(self) -> int:
         """
         Remove all closed positions from tracking.
@@ -495,18 +480,18 @@ class PositionManager:
         for position in closed:
             del self.positions[position.window_ts]
         return len(closed)
-    
+
     def get_stats(self) -> Dict:
         """Get summary statistics of all positions."""
         total = len(self.positions)
         active = len(self.get_active_positions())
         pending = len(self.get_pending_positions())
         closed = len(self.get_closed_positions())
-        
+
         total_pnl = sum(
             self.calculate_realized_pnl(p) for p in self.get_closed_positions()
         )
-        
+
         return {
             "total_positions": total,
             "active": active,

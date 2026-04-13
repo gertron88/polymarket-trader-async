@@ -1,30 +1,60 @@
-# Trading Configuration
+# Trading Configuration - SINGLE TEST TRADE MODE
+# ⚠️  MAX 1 TRADE ENFORCED - Kelly sizing fixed with realistic parameters
 
 # Bankroll Settings
 bankroll: 100.0
-kelly_fraction: 0.5
-max_position_pct: 0.25
+kelly_fraction: 0.1  # 10% Kelly (reduced from 0.5 for safety)
+max_position_pct: 0.05  # 5% max (was 25%)
+max_position_dollars: 5.0  # Hard cap at $5 for testing
 
 # Risk Management
-daily_loss_limit: 0.10  # 10% of bankroll
-max_consecutive_losses: 3
-max_trades_per_window: 2
+daily_loss_limit: 0.05  # Stop after 5% loss (tighter than 10%)
+max_consecutive_losses: 1  # Stop after 1 loss for test
+max_trades_per_window: 1  # Max 1 trade per window
+max_total_trades: 1  # ⛔ HARD LIMIT: Total trades allowed (1 for test)
 
 # Entry Settings
 limit_price: 0.46
-trade_size: 5.0
+trade_size: 5.0  # Fixed at $5 for test
 min_edge: 0.05  # 5% minimum edge
 btc_threshold: 0.005  # 0.5% BTC move to trigger
 
+# Slippage Model
+slippage:
+  entry_slippage: 0.01  # 1% slippage on entry
+  exit_slippage: 0.01   # 1% slippage on exit
+
+# Profit Assumptions (realistic net profit after slippage)
+assumed_gross_profit_pct: 0.05  # 5% gross profit (was 8%)
+assumed_win_rate: 0.85         # 85% win rate required at 3% net profit
+assumed_loss_pct: 0.10         # 10% loss on losing trades
+
 # Exit Settings
-winner_target: 0.90
+winner_target: 0.52  # Lowered from 0.90 for faster exit (2% profit)
 loser_exit: 0.10
 one_sided_stop_base: 0.35
-max_hold_time: 60  # seconds
+max_hold_time: 8  # 8 seconds max for short-window strategy (was 60)
+min_hold_time: 2.5  # Minimum 2.5s for Polygon block confirmation
+stop_loss_pct: 0.10  # 10% stop loss
 
-# API Configuration
-binance_ws_url: "wss://fstream.binance.com/ws/btcusdt@markPrice@1s"
-polymarket_ws_url: "wss://clob.polymarket.com/ws/market"
+# Circuit Breakers
+circuit_breakers:
+  rpc_latency_ms: 500.0
+  ws_disconnect_seconds: 5.0
+  max_consecutive_losses: 3
+  min_win_rate: 0.65
+  win_rate_window: 100
+  max_daily_loss_pct: 0.05
+  slippage_warning_pct: 0.01
+
+# Price Feed Configuration
+price_feed: coinbase  # Coinbase for low latency
+
+# Trading Mode
+# 'dry_run' - Log signals, no actual trades (for testing)
+# 'paper' - Simulate trades with fake money
+# 'live' - Real trades with real money ⚠️ Requires LIVE_MODE=true env var
+trading_mode: dry_run  # ⚠️ KEEP AS dry_run OR paper FOR TESTING
 
 # Logging
 log_level: INFO

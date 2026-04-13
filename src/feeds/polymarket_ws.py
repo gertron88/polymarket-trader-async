@@ -78,7 +78,7 @@ class PolymarketWebSocket:
     """
     
     # WebSocket configuration
-    WS_URL = "wss://clob.polymarket.com/ws/market"
+    WS_URL = "wss://clob.polymarket.com/ws"
     
     # Reconnection configuration
     INITIAL_RECONNECT_DELAY = 1.0  # seconds

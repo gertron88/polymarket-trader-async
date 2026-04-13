@@ -1,18 +1,27 @@
 """
 Trading Engine - Core event-driven trading logic
+SINGLE TEST TRADE VERSION - Fixed Kelly sizing + Hard trade limit
+
+Strategy: Wait for Coinbase BTC price move, then buy on Polymarket
+in the direction that profits when prices re-align.
 """
 import asyncio
 import logging
 import time
+import os
 from typing import Optional, Dict, Callable
 from dataclasses import dataclass
 
-from ..feeds.binance_ws import BinanceWebSocket
-from ..feeds.polymarket_ws import PolymarketWebSocket
-from ..execution.orders import OrderExecutor
-from ..execution.state import StateManager
-from .position import PositionManager, Position
-from .sizing import KellySizer
+from feeds.price_feed import create_price_feed
+from feeds.polymarket_ws import PolymarketWebSocket
+from market.gamma_api import GammaAPIClient, MarketWindow
+from execution.orders import OrderExecutor
+from execution.state import StateManager
+from execution.clob_client import get_clob_client
+from trading.position import PositionManager, Position
+from trading.sizing import KellySizer
+from trading.short_window_exits import ShortWindowExitManager, ExitTrigger
+from risk import CircuitBreakerPanel
 
 logger = logging.getLogger(__name__)
 
@@ -29,44 +38,68 @@ class TradingEngine:
     """
     Event-driven trading engine for Polymarket BTC arbitrage
     
-    Reacts to price updates via callbacks - no polling
-    Target latency: 80-120ms from BTC move to order placement
+    ⚠️  SINGLE TRADE MODE: Max 1 trade enforced
+    Fixed Kelly with realistic parameters (3% net profit, 85% win rate required)
     """
     
     def __init__(self, config: dict):
         self.config = config
         
         # Components (initialized in initialize())
-        self.binance_ws: Optional[BinanceWebSocket] = None
+        self.price_feed = None
         self.polymarket_ws: Optional[PolymarketWebSocket] = None
         self.order_executor: Optional[OrderExecutor] = None
         self.state_manager: Optional[StateManager] = None
         self.position_manager = PositionManager()
         self.sizer: Optional[KellySizer] = None
+        self.gamma_client: Optional[GammaAPIClient] = None
+        self.breaker_panel: Optional[CircuitBreakerPanel] = None
+        self._exit_managers: Dict[int, ShortWindowExitManager] = {}
         
         # Trading state
         self.daily_pnl = 0.0
         self.daily_loss_hit = False
         self.last_trade_time = 0
         self.cooldown_until = 0
-        self.window_trades: Dict[int, int] = {}  # window_ts -> trade count
+        self.window_trades: Dict[int, int] = {}
+        self.total_trades = 0  # ⛔ HARD LIMIT TRACKER
+        self.has_traded = False  # Flag to block after 1 trade
         
         # Current market data
         self.current_btc_price = 0.0
         self.current_btc_change = 0.0
-        self.poly_prices: Dict[str, dict] = {}  # token_id -> {bid, ask}
+        self.poly_prices: Dict[str, dict] = {}
         
         # Running flag
         self.running = False
         
+        # Trading mode check
+        self.live_mode = os.environ.get('LIVE_MODE', 'false').lower() == 'true'
+        self.trading_mode = config.get('trading_mode', 'dry_run')
+        
     async def initialize(self):
         """Initialize all components"""
-        logger.info("Initializing trading engine...")
+        logger.info("=" * 60)
+        logger.info("INITIALIZING TRADING ENGINE - SINGLE TEST TRADE MODE")
+        logger.info("=" * 60)
         
-        # Initialize Kelly sizer
+        # Log mode
+        if self.trading_mode == 'live' and not self.live_mode:
+            logger.error("⚠️  LIVE MODE REQUESTED but LIVE_MODE env var not set!")
+            logger.error("Set LIVE_MODE=true to enable live trading")
+            self.trading_mode = 'dry_run'
+        
+        logger.info(f"Trading mode: {self.trading_mode}")
+        logger.info(f"Max total trades: {self.config.get('max_total_trades', 1)}")
+        logger.info(f"Max position: ${self.config.get('max_position_dollars', 5.0)}")
+        
+        # Initialize Kelly sizer with realistic parameters
         self.sizer = KellySizer(
             bankroll=self.config.get('bankroll', 100.0),
-            kelly_fraction=self.config.get('kelly_fraction', 0.5)
+            kelly_fraction=self.config.get('kelly_fraction', 0.1),
+            max_position_pct=self.config.get('max_position_pct', 0.05),
+            max_trades=self.config.get('max_total_trades', 1),
+            max_position_dollars=self.config.get('max_position_dollars', 5.0)
         )
         
         # Initialize state manager
@@ -81,34 +114,76 @@ class TradingEngine:
             pos = Position.from_dict(pos_data)
             self.position_manager.add_position(pos)
         
-        # Initialize order executor
-        # TODO: Pass actual ClobClient instance
-        self.order_executor = OrderExecutor(clob_client=None)
+        # Initialize Gamma API client for market discovery
+        self.gamma_client = GammaAPIClient()
+        await self.gamma_client.initialize()
+        
+        # Initialize CLOB client with real credentials
+        clob_wrapper = get_clob_client()
+        clob_client = clob_wrapper.initialize()
+        
+        # Initialize order executor with real client
+        self.order_executor = OrderExecutor(clob_client=clob_client)
         await self.order_executor.initialize()
         
-        # Initialize WebSocket feeds
-        self.binance_ws = BinanceWebSocket(
+        # Check balance (graceful fallback if method not available)
+        try:
+            balance = clob_wrapper.get_balance()
+            logger.info(f"Account balance: {balance['usdc']:.2f} USDC")
+        except Exception as e:
+            logger.warning(f"Could not retrieve balance: {e}")
+            logger.info("Continuing without balance check")
+        
+        # Initialize price feed (Coinbase recommended for EU)
+        feed_exchange = self.config.get('price_feed', 'coinbase').lower()
+        logger.info(f"Using {feed_exchange} for price feed")
+        
+        self.price_feed = create_price_feed(
+            exchange=feed_exchange,
             on_price_update=self._on_btc_update,
-            on_connection_change=self._on_connection_change
+            on_connection_change=self._on_connection_change,
+            product_id='BTC-USD'
         )
         
         self.polymarket_ws = PolymarketWebSocket(
             on_price_update=self._on_polymarket_update
         )
         
+        # Initialize circuit breakers
+        cb_config = self.config.get('circuit_breakers', {})
+        self.breaker_panel = CircuitBreakerPanel(
+            rpc_latency_ms=cb_config.get('rpc_latency_ms', 500.0),
+            ws_disconnect_seconds=cb_config.get('ws_disconnect_seconds', 5.0),
+            max_consecutive_losses=cb_config.get('max_consecutive_losses', 3),
+            min_win_rate=cb_config.get('min_win_rate', 0.65),
+            win_rate_window=cb_config.get('win_rate_window', 100),
+            max_daily_loss_pct=cb_config.get('max_daily_loss_pct', 0.05),
+            slippage_warning_pct=cb_config.get('slippage_warning_pct', 0.01),
+        )
+        self.breaker_panel.set_bankroll(self.config.get('bankroll', 100.0))
+        logger.info("Circuit breakers initialized")
+        
         # Start periodic tasks
         asyncio.create_task(self._periodic_exit_check())
         asyncio.create_task(self._periodic_stats_log())
+        asyncio.create_task(self._periodic_rpc_check())
         
         logger.info("Trading engine initialized")
+        logger.info("=" * 60)
         
     async def _on_btc_update(self, price: float, change_30s: float):
         """Called on every BTC price update (WebSocket push)"""
         self.current_btc_price = price
         self.current_btc_change = change_30s
         
+        # Heartbeat for WS health breaker
+        if self.breaker_panel:
+            self.breaker_panel.ws_breaker.heartbeat_price_feed()
+        
         # Check if this triggers an entry signal
-        if abs(change_30s) >= self.config.get('btc_threshold', 0.005):
+        threshold = self.config.get('btc_threshold', 0.005)
+        if abs(change_30s) >= threshold:
+            logger.info(f"BTC move detected: {change_30s:.4f} ({change_30s*100:.2f}%) | Threshold: {threshold}")
             await self._check_entry_signal(change_30s)
             
     async def _on_polymarket_update(self, token_id: str, best_bid: float, best_ask: float):
@@ -118,6 +193,10 @@ class TradingEngine:
             'ask': best_ask,
             'timestamp': time.time()
         }
+        
+        # Heartbeat for WS health breaker
+        if self.breaker_panel:
+            self.breaker_panel.ws_breaker.heartbeat_polymarket()
         
     async def _check_entry_signal(self, btc_change: float):
         """Check if BTC movement triggers entry"""
@@ -138,10 +217,24 @@ class TradingEngine:
         await self._execute_entry(signal)
         
     async def _should_trade(self) -> bool:
-        """Check if trading conditions are met"""
+        """Check if trading conditions are met - SINGLE TRADE MODE"""
+        
+        # ⛔ HARD LIMIT: Max 1 trade
+        if self.has_traded or self.total_trades >= self.config.get('max_total_trades', 1):
+            if not hasattr(self, '_logged_trade_limit'):
+                logger.info("⛔ Trade limit reached (max 1 trade) - Engine will continue monitoring but not trade")
+                self._logged_trade_limit = True
+            return False
+        
+        # Check circuit breakers
+        if self.breaker_panel:
+            ok, reason = self.breaker_panel.check_all()
+            if not ok:
+                logger.error(f"⛔ Trade blocked by circuit breaker: {reason}")
+                return False
         
         # Check daily loss limit
-        daily_limit = self.config.get('daily_loss_limit', 0.10)
+        daily_limit = self.config.get('daily_loss_limit', 0.05)
         if self.daily_pnl <= -self.config.get('bankroll', 100.0) * daily_limit:
             if not self.daily_loss_hit:
                 logger.warning(f"Daily loss limit hit: ${self.daily_pnl:.2f}")
@@ -153,13 +246,22 @@ class TradingEngine:
             return False
             
         # Check if max positions
-        if len(self.position_manager.get_active_positions()) >= self.config.get('max_positions', 2):
+        if len(self.position_manager.get_active_positions()) >= self.config.get('max_positions', 1):
             return False
             
         return True
         
     async def _execute_entry(self, signal: Signal):
-        """Execute entry orders"""
+        """Execute entry orders - SINGLE TRADE MODE"""
+        
+        # ⛔ Double-check trade limit
+        if self.has_traded or self.total_trades >= self.config.get('max_total_trades', 1):
+            logger.warning("Trade blocked: Max trades already reached")
+            return
+        
+        logger.info("=" * 60)
+        logger.info(f"🚀 EXECUTING ENTRY - Trade {self.total_trades + 1}/1")
+        logger.info("=" * 60)
         
         # Get current window
         window = await self._get_current_window()
@@ -169,12 +271,6 @@ class TradingEngine:
             
         window_ts = window['timestamp']
         
-        # Check max trades per window
-        max_trades = self.config.get('max_trades_per_window', 2)
-        if self.window_trades.get(window_ts, 0) >= max_trades:
-            logger.info(f"Max trades reached for window {window_ts}")
-            return
-            
         # Get token IDs
         up_token = window['up_token']
         down_token = window['down_token']
@@ -199,13 +295,28 @@ class TradingEngine:
             logger.info(f"Edge too small: {edge:.4f} < {min_edge}")
             return
             
-        # Calculate position size
+        # Calculate position size with realistic Kelly
         size = self.sizer.calculate_size(confidence=signal.confidence)
+        max_size = self.config.get('max_position_dollars', 5.0)
+        size = min(size, max_size)  # Hard cap
+        
         if size < 1.0:
             logger.info(f"Size too small: ${size:.2f}")
             return
             
-        logger.info(f"Entering window {window_ts} | Size: ${size:.2f} | Edge: {edge:.4f}")
+        logger.info(f"Window: {window_ts}")
+        logger.info(f"Signal: {signal.side} | BTC change: {signal.btc_change:.4f}")
+        logger.info(f"Position size: ${size:.2f} (max ${max_size})")
+        logger.info(f"Edge: {edge:.4f}")
+        logger.info(f"Trading mode: {self.trading_mode}")
+        
+        if self.trading_mode == 'dry_run':
+            logger.info("⚠️  DRY RUN MODE - Not placing actual orders")
+            logger.info("=" * 60)
+            # Mark as traded even in dry run to test the flow
+            self.has_traded = True
+            self.total_trades += 1
+            return
         
         # Create position
         position = self.position_manager.create_position(
@@ -219,8 +330,10 @@ class TradingEngine:
         await self.polymarket_ws.subscribe(up_token)
         await self.polymarket_ws.subscribe(down_token)
         
-        # Place orders concurrently
+        # Place orders
         limit_price = self.config.get('limit_price', 0.46)
+        logger.info(f"Placing entry orders at ${limit_price:.2f}...")
+        
         up_id, down_id = await self.order_executor.place_entry_orders(
             up_token=up_token,
             down_token=down_token,
@@ -230,12 +343,34 @@ class TradingEngine:
         
         if up_id:
             position.up_id = up_id
+            logger.info(f"UP order placed: {up_id}")
         if down_id:
             position.down_id = down_id
+            logger.info(f"DOWN order placed: {down_id}")
+        
+        # Record expected price for slippage monitoring
+        if self.breaker_panel:
+            self.breaker_panel.slippage_monitor.record_entry(limit_price, limit_price, size)
+            
+        # Create short-window exit manager for this position
+        exit_mgr = ShortWindowExitManager(
+            entry_price=limit_price,
+            side=signal.side,
+            profit_target_pct=self.config.get('assumed_gross_profit_pct', 0.05)
+            - self.config.get('slippage', {}).get('entry_slippage', 0.01)
+            - self.config.get('slippage', {}).get('exit_slippage', 0.01),
+            stop_loss_pct=self.config.get('stop_loss_pct', 0.10)
+        )
+        self._exit_managers[window_ts] = exit_mgr
             
         # Update tracking
+        self.has_traded = True
+        self.total_trades += 1
         self.window_trades[window_ts] = self.window_trades.get(window_ts, 0) + 1
         self.last_trade_time = time.time()
+        
+        logger.info(f"✅ Entry complete - Trade {self.total_trades}/1 executed")
+        logger.info("=" * 60)
         
         # Save state
         await self.state_manager.update_position(position)
@@ -256,67 +391,51 @@ class TradingEngine:
             await self._check_position_exit(position)
             
     async def _check_position_exit(self, position: Position):
-        """Check exit conditions for a single position"""
+        """Check exit conditions for a single position using short-window logic."""
         
         # Get current prices
         up_bid = self.poly_prices.get(position.up_token, {}).get('bid', 0)
         down_bid = self.poly_prices.get(position.down_token, {}).get('bid', 0)
         
-        # Update position with current prices
-        self.position_manager.update_prices(position.window_ts, up_bid, down_bid)
-        
-        # Calculate time remaining
+        # Calculate time remaining in window
         window_end = position.window_ts + 300  # 5 minute window
         time_remaining = window_end - time.time()
         
-        exit_reason = None
         exit_side = None
         exit_price = 0.0
+        exit_reason = None
         
-        # Check various exit conditions
-        if position.both_filled() and not position.both_exited():
-            # Both filled - exit at targets
-            if up_bid >= self.config.get('winner_target', 0.90):
+        # Use short-window exit manager if available
+        exit_mgr = self._exit_managers.get(position.window_ts)
+        if exit_mgr and position.up_filled and not position.up_exited:
+            result = exit_mgr.check_exit(up_bid, time_remaining)
+            if result.should_exit:
                 exit_side = 'UP'
-                exit_price = up_bid
-                exit_reason = f"Winner target hit: ${up_bid:.2f}"
-            elif down_bid >= self.config.get('winner_target', 0.90):
+                exit_price = result.exit_price
+                exit_reason = result.reason
+                
+        if exit_mgr and position.down_filled and not position.down_exited and not exit_side:
+            result = exit_mgr.check_exit(down_bid, time_remaining)
+            if result.should_exit:
                 exit_side = 'DOWN'
-                exit_price = down_bid
-                exit_reason = f"Winner target hit: ${down_bid:.2f}"
+                exit_price = result.exit_price
+                exit_reason = result.reason
                 
-        elif position.up_filled and not position.down_filled and not position.up_exited:
-            # One-sided UP position
-            stop_price = self.position_manager.calculate_exit_price(position, time_remaining)
-            if up_bid <= stop_price:
-                exit_side = 'UP'
-                exit_price = up_bid
-                exit_reason = f"Stop loss: ${up_bid:.2f} <= ${stop_price:.2f}"
-                
-        elif position.down_filled and not position.up_filled and not position.down_exited:
-            # One-sided DOWN position
-            stop_price = self.position_manager.calculate_exit_price(position, time_remaining)
-            if down_bid <= stop_price:
-                exit_side = 'DOWN'
-                exit_price = down_bid
-                exit_reason = f"Stop loss: ${down_bid:.2f} <= ${stop_price:.2f}"
-                
-        # Time-based exit
-        time_held = time.time() - position.entry_time
-        max_hold = self.config.get('max_hold_time', 60)
-        if time_held > max_hold and not exit_side:
-            # Exit if profitable or down 10%
-            pnl = self.position_manager.calculate_pnl(position)
-            if pnl > 0:
-                # Exit profitable side(s)
-                if position.up_filled and not position.up_exited and up_bid > position.entry_price:
+        # One-sided stop loss fallback (if no exit manager)
+        if not exit_side:
+            if position.up_filled and not position.down_filled and not position.up_exited:
+                stop_price = self.position_manager.calculate_exit_price(position, time_remaining)[0]
+                if up_bid <= stop_price:
                     exit_side = 'UP'
                     exit_price = up_bid
-                    exit_reason = "Time exit (profit)"
-                elif position.down_filled and not position.down_exited and down_bid > position.entry_price:
+                    exit_reason = f"Stop loss: ${up_bid:.2f} <= ${stop_price:.2f}"
+                    
+            elif position.down_filled and not position.up_filled and not position.down_exited:
+                stop_price = self.position_manager.calculate_exit_price(position, time_remaining)[1]
+                if down_bid >= stop_price:
                     exit_side = 'DOWN'
                     exit_price = down_bid
-                    exit_reason = "Time exit (profit)"
+                    exit_reason = f"Stop loss: ${down_bid:.2f} <= ${stop_price:.2f}"
                     
         # Execute exit if triggered
         if exit_side and exit_reason:
@@ -345,6 +464,14 @@ class TradingEngine:
             self.daily_pnl += pnl
             self.sizer.update_trade(pnl)
             
+            # Feed circuit breakers
+            if self.breaker_panel:
+                self.breaker_panel.record_trade(pnl)
+            
+            # Record slippage on exit
+            if self.breaker_panel:
+                self.breaker_panel.slippage_monitor.record_exit(exit_price, exit_price, position.size)
+            
             logger.info(f"Exit complete: P&L ${pnl:+.2f} | Daily: ${self.daily_pnl:+.2f}")
             
             # Save state
@@ -353,6 +480,10 @@ class TradingEngine:
             # Set cooldown after loss
             if pnl < 0:
                 self.cooldown_until = time.time() + 10  # 10s cooldown
+            
+            # Clean up exit manager
+            if position.window_ts in self._exit_managers:
+                del self._exit_managers[position.window_ts]
                 
     async def _periodic_stats_log(self):
         """Log periodic statistics"""
@@ -361,25 +492,65 @@ class TradingEngine:
             
             stats = self.sizer.get_stats()
             active_count = len(self.position_manager.get_active_positions())
+            breaker_status = self.breaker_panel.get_status() if self.breaker_panel else {}
+            tripped = [k for k, v in breaker_status.items() if v.get('tripped')]
             
             logger.info(
                 f"Stats: Daily P&L=${self.daily_pnl:+.2f} | "
                 f"Win Rate={stats.get('win_rate', 0):.1%} | "
                 f"Active Positions={active_count}"
             )
+            if tripped:
+                logger.warning(f"Tripped breakers: {', '.join(tripped)}")
+            
+    async def _periodic_rpc_check(self):
+        """Periodic RPC latency check for circuit breaker."""
+        while self.running:
+            await asyncio.sleep(5)
+            if not self.breaker_panel:
+                continue
+            try:
+                # Simple latency proxy: measure time to get current window
+                start = time.time()
+                if self.gamma_client:
+                    await self.gamma_client.get_current_window()
+                latency_ms = (time.time() - start) * 1000
+                self.breaker_panel.rpc_breaker.record_latency(latency_ms)
+                self.breaker_panel.rpc_breaker.check()
+            except Exception as e:
+                logger.warning(f"RPC check failed: {e}")
+                self.breaker_panel.rpc_breaker.record_latency(9999.0)
+                self.breaker_panel.rpc_breaker.check()
             
     async def _get_current_window(self) -> Optional[dict]:
-        """Get current 5-minute trading window"""
-        # TODO: Implement window discovery via Gamma API
-        # For now, return mock window
-        now = int(time.time())
-        window_ts = (now // 300) * 300
+        """Get current 5-minute trading window via Gamma API"""
+        if not self.gamma_client:
+            logger.error("Gamma API client not initialized")
+            return None
         
-        return {
-            'timestamp': window_ts,
-            'up_token': 'mock_up_token',
-            'down_token': 'mock_down_token'
-        }
+        try:
+            window = await self.gamma_client.get_current_window()
+            if not window:
+                logger.debug("No active trading window found")
+                return None
+            
+            # Log window details for debugging
+            logger.info(
+                f"Active window: {window.timestamp} | "
+                f"Edge: {window.edge:.4f} | "
+                f"Combined: ${window.combined_price:.4f}"
+            )
+            
+            return {
+                'timestamp': window.timestamp,
+                'up_token': window.up_token,
+                'down_token': window.down_token,
+                'market_id': window.market_id,
+                'end_time': window.end_time.isoformat() if hasattr(window.end_time, 'isoformat') else str(window.end_time)
+            }
+        except Exception as e:
+            logger.error(f"Failed to get current window: {e}")
+            return None
         
     def _on_connection_change(self, connected: bool):
         """Handle WebSocket connection changes"""
@@ -394,7 +565,7 @@ class TradingEngine:
         self.running = True
         
         # Start WebSocket feeds
-        asyncio.create_task(self.binance_ws.connect())
+        asyncio.create_task(self.price_feed.connect())
         asyncio.create_task(self.polymarket_ws.connect())
         
         logger.info("Trading engine running")
@@ -409,14 +580,18 @@ class TradingEngine:
         self.running = False
         
         # Close WebSockets
-        if self.binance_ws:
-            await self.binance_ws.close()
+        if self.price_feed:
+            await self.price_feed.close()
         if self.polymarket_ws:
             await self.polymarket_ws.close()
             
         # Close executor
         if self.order_executor:
             await self.order_executor.close()
+            
+        # Close Gamma client
+        if self.gamma_client:
+            await self.gamma_client.close()
             
         # Final state flush
         if self.state_manager:
