@@ -4,6 +4,9 @@
 .env.vps
 .env.*.local
 
+# Scripts with embedded secrets
+run_bot.sh
+
 # Python
 __pycache__/
 *.py[cod]
